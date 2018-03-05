@@ -31,7 +31,7 @@ module Hako
 
       # @return [Aws::ElasticLoadBalancingV2::Types::LoadBalancer]
       def describe_load_balancer
-        elb_client.describe_load_balancers(names: [name]).load_balancers[0]
+        elb_client.describe_load_balancers(names: [@elb_v2_config.fetch('elb_name', name)]).load_balancers[0]
       rescue Aws::ElasticLoadBalancingV2::Errors::LoadBalancerNotFound
         nil
       end
@@ -54,7 +54,7 @@ module Hako
         unless load_balancer
           tags = @elb_v2_config.fetch('tags', {}).map { |k, v| { key: k, value: v.to_s } }
           load_balancer = elb_client.create_load_balancer(
-            name: name,
+            name: @elb_v2_config.fetch('elb_name', name),
             subnets: @elb_v2_config.fetch('subnets'),
             security_groups: @elb_v2_config.fetch('security_groups'),
             scheme: @elb_v2_config.fetch('scheme', nil),
