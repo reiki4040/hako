@@ -143,11 +143,44 @@ module Hako
 
         load_balancer = describe_load_balancer
         if load_balancer
-          if @dry_run
-            Hako.logger.info("elb_client.delete_load_balancer(load_balancer_arn: #{load_balancer.load_balancer_arn})")
+          lb = describe_load_balancer
+          listeners = elb_client.describe_listeners(load_balancer_arn: lb.load_balancer_arn).listeners
+
+          config_listeners = @elb_v2_config.fetch('listeners')
+          dryrun_deleted_listener_count = 0
+          if listeners.length != config_listeners.length
+            listeners.each do |l|
+              config_listeners.each do |cl|
+                if  l.port == cl.fetch('port')
+                  if @dry_run
+                    Hako.logger.info("elb_client.delete_listener(listener_arn: #{l.listener_arn})")
+                    dryrun_deleted_listener_count += 1
+                  else
+                    elb_client.delete_listener(listener_arn: l.listener_arn)
+                    Hako.logger.info "Deleted port #{l.port} Listener #{l.listener_arn}"
+                  end
+                end
+              end
+            end
+
+            updated_listeners = elb_client.describe_listeners(load_balancer_arn: lb.load_balancer_arn)
+            if (updated_listeners.listeners.length - dryrun_deleted_listener_count) == 0
+              if @dry_run
+              Hako.logger.info("elb_client.delete_load_balancer(load_balancer_arn: #{load_balancer.load_balancer_arn})")
+              else
+                elb_client.delete_load_balancer(load_balancer_arn: load_balancer.load_balancer_arn)
+                Hako.logger.info "Deleted ELBv2 #{load_balancer.load_balancer_arn}"
+              end
+            else
+              Hako.logger.info("ELBv2: #{load_balancer.load_balancer_arn} has multiple listeners. so ELBv2 is not remove.")
+            end
           else
-            elb_client.delete_load_balancer(load_balancer_arn: load_balancer.load_balancer_arn)
-            Hako.logger.info "Deleted ELBv2 #{load_balancer.load_balancer_arn}"
+            if @dry_run
+              Hako.logger.info("elb_client.delete_load_balancer(load_balancer_arn: #{load_balancer.load_balancer_arn})")
+            else
+              elb_client.delete_load_balancer(load_balancer_arn: load_balancer.load_balancer_arn)
+              Hako.logger.info "Deleted ELBv2 #{load_balancer.load_balancer_arn}"
+            end
           end
         else
           Hako.logger.info "ELBv2 #{name} doesn't exist"
