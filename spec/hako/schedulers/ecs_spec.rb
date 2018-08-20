@@ -39,6 +39,7 @@ RSpec.describe Hako::Schedulers::Ecs do
       },
       placement_constraints: [],
       placement_strategy: [],
+      scheduling_strategy: nil,
       launch_type: nil,
       platform_version: nil,
       network_configuration: nil,
@@ -83,6 +84,7 @@ RSpec.describe Hako::Schedulers::Ecs do
         volumes_from: [],
         user: nil,
         log_configuration: nil,
+        health_check: nil,
         ulimits: nil,
         extra_hosts: nil,
       }],
@@ -266,7 +268,7 @@ RSpec.describe Hako::Schedulers::Ecs do
         allow(ecs_client).to receive(:describe_task_definition).with(task_definition: app.id).and_raise(Aws::ECS::Errors::ClientException.new(nil, 'Unable to describe task definition')).once
 
         allow(Aws::ElasticLoadBalancingV2::Client).to receive(:new).and_return(elb_v2_client)
-        allow(elb_v2_client).to receive(:describe_load_balancers).with(names: ["hako-#{app.id}"]).and_raise(Aws::ElasticLoadBalancingV2::Errors::LoadBalancerNotFound.new(nil, '')).once
+        allow(elb_v2_client).to receive(:describe_load_balancers).with(names: ["hako-#{app.id}"]).and_raise(Aws::ElasticLoadBalancingV2::Errors::LoadBalancerNotFound.new(nil, ''))
         allow(elb_v2_client).to receive(:describe_target_groups).with(names: ["hako-#{app.id}"]) {
           if target_groups.empty?
             raise Aws::ElasticLoadBalancingV2::Errors::TargetGroupNotFound.new(nil, '')
@@ -290,6 +292,7 @@ RSpec.describe Hako::Schedulers::Ecs do
           subnets: ['subnet-11111111', 'subnet-22222222'],
           security_groups: ['sg-11111111'],
           scheme: nil,
+          type: nil,
           tags: nil,
         ).and_return(Aws::ElasticLoadBalancingV2::Types::CreateLoadBalancerOutput.new(
           load_balancers: [Aws::ElasticLoadBalancingV2::Types::LoadBalancer.new(

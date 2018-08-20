@@ -35,6 +35,7 @@ module Hako
           struct.member(:user, Schema::Nullable.new(Schema::String.new))
           struct.member(:privileged, Schema::Boolean.new)
           struct.member(:log_configuration, Schema::Nullable.new(log_configuration_schema))
+          struct.member(:health_check, Schema::Nullable.new(health_check_schema))
           struct.member(:ulimits, Schema::Nullable.new(ulimits_schema))
           struct.member(:extra_hosts, Schema::Nullable.new(extra_hosts_schema))
           struct.member(:linux_parameters, Schema::Nullable.new(linux_parameters_schema))
@@ -78,6 +79,16 @@ module Hako
         end
       end
 
+      def health_check_schema
+        Schema::Structure.new.tap do |struct|
+          struct.member(:command, Schema::OrderedArray.new(Schema::String.new))
+          struct.member(:interval, Schema::Integer.new)
+          struct.member(:timeout, Schema::Integer.new)
+          struct.member(:retries, Schema::Integer.new)
+          struct.member(:start_period, Schema::Integer.new)
+        end
+      end
+
       def ulimits_schema
         Schema::UnorderedArray.new(ulimit_schema)
       end
@@ -95,6 +106,8 @@ module Hako
           struct.member(:capabilities, Schema::Nullable.new(capabilities_schema))
           struct.member(:devices, Schema::Nullable.new(devices_schema))
           struct.member(:init_process_enabled, Schema::Nullable.new(Schema::Boolean.new))
+          struct.member(:shared_memory_size, Schema::Nullable.new(Schema::Integer.new))
+          struct.member(:tmpfs, Schema::Nullable.new(tmpfs_schema))
         end
       end
 
@@ -115,6 +128,16 @@ module Hako
           struct.member(:container_path, Schema::Nullable.new(Schema::String.new))
           struct.member(:permissions, Schema::UnorderedArray.new(Schema::String.new))
         end
+      end
+
+      def tmpfs_schema
+        Schema::UnorderedArray.new(
+          Schema::Structure.new.tap do |struct|
+            struct.member(:container_path, Schema::String.new)
+            struct.member(:mount_options, Schema::UnorderedArray.new(Schema::String.new))
+            struct.member(:size, Schema::Integer.new)
+          end
+        )
       end
 
       def extra_hosts_schema
