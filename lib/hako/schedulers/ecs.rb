@@ -5,6 +5,7 @@ require 'aws-sdk-ec2'
 require 'aws-sdk-ecs'
 require 'aws-sdk-s3'
 require 'aws-sdk-sns'
+require 'aws-sdk-servicediscovery'
 require 'hako'
 require 'hako/error'
 require 'hako/scheduler'
@@ -33,6 +34,7 @@ module Hako
         @region = options.fetch('region') { validation_error!('region must be set') }
         @role = options.fetch('role', nil)
         @task_role_arn = options.fetch('task_role_arn', nil)
+        @service_discovery = options.fetch('service_discovery', nil)
         @ecs_elb_options = options.fetch('elb', nil)
         @ecs_elb_v2_options = options.fetch('elb_v2', nil)
         if @ecs_elb_options && @ecs_elb_v2_options
@@ -113,7 +115,91 @@ module Hako
           else
             Hako.logger.info "Task definition isn't changed: #{task_definition.task_definition_arn}"
           end
-          current_service ||= create_initial_service(task_definition.task_definition_arn, front_port)
+
+          # TODO crate private dns namespace
+          registry_arn = ''
+          if !@service_discovery.nil?
+              # TODO required if network mode 'host' or 'bridge'
+              @registry_container_name = @service_discovery['container_name']
+              @registry_container_port = @service_discovery['container_port']
+
+              @registry_dns_prefix = @service_discovery['dns_prefix']
+
+              # check already exists namespace?
+              namespaces_resp = service_discovery_client.list_namespaces(filters: [
+                  {name:'TYPE', values:['DNS_PRIVATE'], condition:'EQ'},
+              ])
+
+              namespace_id = ''
+              namespace_arn = ''
+              if namespaces_resp.namespaces.size > 0
+                  namespaces_resp.namespaces.each { |namespace|
+                      if namespace.name == @service_discovery['name']
+                          namespace_id = namespace.id
+                          namespace_arn = namespace.arn
+                      end
+                  }
+              end
+
+              if namespace_id == ''
+                  operation_id = service_discovery_client.create_private_dns_namespace(name: @service_discovery['name'], vpc: @service_discovery['vpc_id']).operation_id
+                  operation = service_discovery_client.get_operation(operation_id: operation_id)
+                  if operation.status != 'SUCCESS'
+                      # TODO Fail or wait if not fail
+                  end
+
+                  namespace_id = operation.targets[:NAMESPACE]
+                  Hako.logger.info "Created ECS service discovery namespace: namespace: #{operation.targets[:NAMESPACE]}"
+              else
+                  Hako.logger.info "ECS service discovery namespace already exists: #{namespace_arn}"
+              end
+
+              # check exists service
+              services_resp = service_discovery_client.list_services(filters: [
+                  {name:'NAMESPACE_ID', values:[namespace_id], condition:'EQ'},
+              ])
+
+              if services_resp.services.size > 0
+                  services_resp.services.each {|service|
+                      if service.name == @registry_dns_prefix
+                          registry_arn = service.arn
+                      end
+                  }
+              end
+
+              # create service
+              if registry_arn == ''
+                  ttl = 300
+                  if @service_discovery['ttl'].nil?
+                      ttl = @service_discovery['ttl']
+                  end
+                  createservice_params = {
+                      name: @registry_dns_prefix,
+                      dns_config: {
+                          namespace_id: namespace_id,
+                          dns_records:[
+                              {
+                                  type: 'SRV',
+                                  ttl: ttl,
+                              }
+                          ]
+                      },
+                      health_check_custom_config: {
+                         failure_threshold: 1,
+                      },
+                  }
+
+                  # TODO error handle but not return error status..?
+                  resp = service_discovery_client.create_service(createservice_params)
+                  registry_arn = resp.service.arn
+
+                  Hako.logger.info "Created ECS service discovery service: #{registry_arn}"
+              else
+                  Hako.logger.info "ECS service discovery service already exists: #{registry_arn}"
+              end
+          end
+
+          current_service ||= create_initial_service(task_definition.task_definition_arn, front_port, registry_arn)
           service = update_service(current_service, task_definition.task_definition_arn)
           if service == :noop
             Hako.logger.info "Service isn't changed"
@@ -289,6 +375,8 @@ module Hako
             Hako.logger.info "ecs_client.delete_service(cluster: #{service.cluster_arn}, service: #{service.service_arn})"
           else
             ecs_client.update_service(cluster: service.cluster_arn, service: service.service_arn, desired_count: 0)
+            # TODO remove ECS service discovery service
+            # TODO try delete Namespace(fail if namespace is not empty, so not need empty check)
             ecs_client.delete_service(cluster: service.cluster_arn, service: service.service_arn)
             Hako.logger.info "#{service.service_arn} is deleted"
           end
@@ -337,6 +425,11 @@ module Hako
           else
             EcsElbV2.new(@app_id, @region, @ecs_elb_v2_options, dry_run: @dry_run)
           end
+      end
+
+      # @return [Aws::ServiceDiscovery::Client]
+      def service_discovery_client
+        @service_discovery_client ||= Aws::ServiceDiscovery::Client.new(region: @region)
       end
 
       # @return [Aws::ECS::Types::Service, nil]
@@ -812,7 +905,7 @@ module Hako
       # @param [String] task_definition_arn
       # @param [Fixnum] front_port
       # @return [Aws::ECS::Types::Service]
-      def create_initial_service(task_definition_arn, front_port)
+      def create_initial_service(task_definition_arn, front_port, registry_arn)
         params = {
           cluster: @cluster,
           service_name: @app_id,
@@ -834,6 +927,20 @@ module Hako
           ecs_elb_client.modify_attributes
           params[:load_balancers] = [ecs_elb_client.load_balancer_params_for_service]
         end
+
+        # set service discovery (service_registries)
+        if registry_arn != ''
+            registry = {
+                    registry_arn: registry_arn,
+            }
+            if !@registry_container_name.nil? and !@registry_container_port.nil?
+                    registry[:container_name] = @registry_container_name
+                    registry[:container_port] = @registry_container_port
+            end
+
+            params[:service_registries] = [registry]
+        end
+
         ecs_client.create_service(params).service
       end
 
