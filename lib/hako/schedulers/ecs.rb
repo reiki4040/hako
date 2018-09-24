@@ -5,6 +5,7 @@ require 'aws-sdk-ec2'
 require 'aws-sdk-ecs'
 require 'aws-sdk-s3'
 require 'aws-sdk-sns'
+require 'aws-sdk-servicediscovery'
 require 'hako'
 require 'hako/error'
 require 'hako/scheduler'
@@ -13,6 +14,7 @@ require 'hako/schedulers/ecs_definition_comparator'
 require 'hako/schedulers/ecs_elb'
 require 'hako/schedulers/ecs_elb_v2'
 require 'hako/schedulers/ecs_service_comparator'
+require 'hako/schedulers/ecs_volume_comparator'
 
 module Hako
   module Schedulers
@@ -32,6 +34,7 @@ module Hako
         @region = options.fetch('region') { validation_error!('region must be set') }
         @role = options.fetch('role', nil)
         @task_role_arn = options.fetch('task_role_arn', nil)
+        @service_discovery = options.fetch('service_discovery', nil)
         @ecs_elb_options = options.fetch('elb', nil)
         @ecs_elb_v2_options = options.fetch('elb_v2', nil)
         if @ecs_elb_options && @ecs_elb_v2_options
@@ -45,7 +48,7 @@ module Hako
         @dynamic_port_mapping = options.fetch('dynamic_port_mapping', @ecs_elb_options.nil?)
         @health_check_grace_period_seconds = options.fetch('health_check_grace_period_seconds', nil)
         if options.key?('autoscaling')
-          @autoscaling = EcsAutoscaling.new(options.fetch('autoscaling'), @region, dry_run: @dry_run)
+          @autoscaling = EcsAutoscaling.new(options.fetch('autoscaling'), @region, ecs_elb_client, dry_run: @dry_run)
         end
         @autoscaling_group_for_oneshot = options.fetch('autoscaling_group_for_oneshot', nil)
         @autoscaling_topic_for_oneshot = options.fetch('autoscaling_topic_for_oneshot', nil)
@@ -94,6 +97,9 @@ module Hako
         definitions = create_definitions(containers)
 
         if @dry_run
+          volumes_definition.each do |d|
+            print_volume_definition_in_cli_format(d)
+          end
           definitions.each do |d|
             print_definition_in_cli_format(d)
           end
@@ -109,7 +115,91 @@ module Hako
           else
             Hako.logger.info "Task definition isn't changed: #{task_definition.task_definition_arn}"
           end
-          current_service ||= create_initial_service(task_definition.task_definition_arn, front_port)
+
+          # TODO crate private dns namespace
+          registry_arn = ''
+          if !@service_discovery.nil?
+              # TODO required if network mode 'host' or 'bridge'
+              @registry_container_name = @service_discovery['container_name']
+              @registry_container_port = @service_discovery['container_port']
+
+              @registry_dns_prefix = @service_discovery['dns_prefix']
+
+              # check already exists namespace?
+              namespaces_resp = service_discovery_client.list_namespaces(filters: [
+                  {name:'TYPE', values:['DNS_PRIVATE'], condition:'EQ'},
+              ])
+
+              namespace_id = ''
+              namespace_arn = ''
+              if namespaces_resp.namespaces.size > 0
+                  namespaces_resp.namespaces.each { |namespace|
+                      if namespace.name == @service_discovery['name']
+                          namespace_id = namespace.id
+                          namespace_arn = namespace.arn
+                      end
+                  }
+              end
+
+              if namespace_id == ''
+                  operation_id = service_discovery_client.create_private_dns_namespace(name: @service_discovery['name'], vpc: @service_discovery['vpc_id']).operation_id
+                  operation = service_discovery_client.get_operation(operation_id: operation_id)
+                  if operation.status != 'SUCCESS'
+                      # TODO Fail or wait if not fail
+                  end
+
+                  namespace_id = operation.targets[:NAMESPACE]
+                  Hako.logger.info "Created ECS service discovery namespace: namespace: #{operation.targets[:NAMESPACE]}"
+              else
+                  Hako.logger.info "ECS service discovery namespace already exists: #{namespace_arn}"
+              end
+
+              # check exists service
+              services_resp = service_discovery_client.list_services(filters: [
+                  {name:'NAMESPACE_ID', values:[namespace_id], condition:'EQ'},
+              ])
+
+              if services_resp.services.size > 0
+                  services_resp.services.each {|service|
+                      if service.name == @registry_dns_prefix
+                          registry_arn = service.arn
+                      end
+                  }
+              end
+
+              # create service
+              if registry_arn == ''
+                  ttl = 300
+                  if @service_discovery['ttl'].nil?
+                      ttl = @service_discovery['ttl']
+                  end
+                  createservice_params = {
+                      name: @registry_dns_prefix,
+                      dns_config: {
+                          namespace_id: namespace_id,
+                          dns_records:[
+                              {
+                                  type: 'SRV',
+                                  ttl: ttl,
+                              }
+                          ]
+                      },
+                      health_check_custom_config: {
+                         failure_threshold: 1,
+                      },
+                  }
+
+                  # TODO error handle but not return error status..?
+                  resp = service_discovery_client.create_service(createservice_params)
+                  registry_arn = resp.service.arn
+
+                  Hako.logger.info "Created ECS service discovery service: #{registry_arn}"
+              else
+                  Hako.logger.info "ECS service discovery service already exists: #{registry_arn}"
+              end
+          end
+
+          current_service ||= create_initial_service(task_definition.task_definition_arn, front_port, registry_arn)
           service = update_service(current_service, task_definition.task_definition_arn)
           if service == :noop
             Hako.logger.info "Service isn't changed"
@@ -176,6 +266,9 @@ module Hako
         end
 
         if @dry_run
+          volumes_definition.each do |d|
+            print_volume_definition_in_cli_format(d)
+          end
           definitions.each do |d|
             if d[:name] == 'app'
               d[:command] = commands
@@ -282,6 +375,8 @@ module Hako
             Hako.logger.info "ecs_client.delete_service(cluster: #{service.cluster_arn}, service: #{service.service_arn})"
           else
             ecs_client.update_service(cluster: service.cluster_arn, service: service.service_arn, desired_count: 0)
+            # TODO remove ECS service discovery service
+            # TODO try delete Namespace(fail if namespace is not empty, so not need empty check)
             ecs_client.delete_service(cluster: service.cluster_arn, service: service.service_arn)
             Hako.logger.info "#{service.service_arn} is deleted"
           end
@@ -330,6 +425,11 @@ module Hako
           else
             EcsElbV2.new(@app_id, @region, @ecs_elb_v2_options, dry_run: @dry_run)
           end
+      end
+
+      # @return [Aws::ServiceDiscovery::Client]
+      def service_discovery_client
+        @service_discovery_client ||= Aws::ServiceDiscovery::Client.new(region: @region)
       end
 
       # @return [Aws::ECS::Types::Service, nil]
@@ -405,6 +505,10 @@ module Hako
           # Initial deployment
           return true
         end
+        actual_volume_definitions = {}
+        actual_definition.volumes.each do |v|
+          actual_volume_definitions[v.name] = v
+        end
         container_definitions = {}
         actual_definition.container_definitions.each do |c|
           container_definitions[c.name] = c
@@ -413,7 +517,10 @@ module Hako
         if actual_definition.task_role_arn != @task_role_arn
           return true
         end
-        if different_volumes?(actual_definition.volumes)
+        if volumes_definition.any? { |definition| different_volume?(definition, actual_volume_definitions.delete(definition[:name])) }
+          return true
+        end
+        unless actual_volume_definitions.empty?
           return true
         end
         if desired_definitions.any? { |definition| different_definition?(definition, container_definitions.delete(definition[:name])) }
@@ -441,23 +548,11 @@ module Hako
         false
       end
 
-      # @param [Hash<String, Hash<String, String>>] actual_volumes
+      # @param [Hash] expected_volume
+      # @param [Aws::ECS::Types::Volume] actual_volume
       # @return [Boolean]
-      def different_volumes?(actual_volumes)
-        if @volumes.size != actual_volumes.size
-          return true
-        end
-        actual_volumes.each do |actual_volume|
-          expected_volume = @volumes[actual_volume.name]
-          if expected_volume.nil?
-            return true
-          end
-          if expected_volume['source_path'] != actual_volume.host.source_path
-            return true
-          end
-        end
-
-        false
+      def different_volume?(expected_volume, actual_volume)
+        EcsVolumeComparator.new(expected_volume).different?(actual_volume)
       end
 
       # @param [Hash] expected_container
@@ -534,13 +629,28 @@ module Hako
         raise Error.new('Unable to register task definition for oneshot due to too many client errors')
       end
 
-      # @return [Hash]
+      # @return [Array<Hash>]
       def volumes_definition
-        @volumes.map do |name, volume|
-          {
-            name: name,
-            host: { source_path: volume['source_path'] },
-          }
+        @volumes_definition ||= @volumes.map do |name, volume|
+          definition = { name: name }
+          if volume.key?('docker_volume_configuration')
+            configuration = volume['docker_volume_configuration']
+            definition[:docker_volume_configuration] = {
+              autoprovision: configuration['autoprovision'],
+              driver: configuration['driver'],
+              # ECS API doesn't allow 'driver_opts' to be an empty hash.
+              driver_opts: configuration['driver_opts'],
+              # ECS API doesn't allow 'labels' to be an empty hash.
+              labels: configuration['labels'],
+              scope: configuration['scope'],
+            }
+          else
+            # When neither 'host' nor 'docker_volume_configuration' is
+            # specified, ECS API treats it as if 'host' is specified without
+            # 'source_path'.
+            definition[:host] = { source_path: volume['source_path'] }
+          end
+          definition
         end
       end
 
@@ -795,7 +905,7 @@ module Hako
       # @param [String] task_definition_arn
       # @param [Fixnum] front_port
       # @return [Aws::ECS::Types::Service]
-      def create_initial_service(task_definition_arn, front_port)
+      def create_initial_service(task_definition_arn, front_port, registry_arn)
         params = {
           cluster: @cluster,
           service_name: @app_id,
@@ -817,6 +927,20 @@ module Hako
           ecs_elb_client.modify_attributes
           params[:load_balancers] = [ecs_elb_client.load_balancer_params_for_service]
         end
+
+        # set service discovery (service_registries)
+        if registry_arn != ''
+            registry = {
+                    registry_arn: registry_arn,
+            }
+            if !@registry_container_name.nil? and !@registry_container_port.nil?
+                    registry[:container_name] = @registry_container_name
+                    registry[:container_port] = @registry_container_port
+            end
+
+            params[:service_registries] = [registry]
+        end
+
         ecs_client.create_service(params).service
       end
 
@@ -1045,6 +1169,31 @@ module Hako
       end
 
       # @param [Hash] definition
+      # @return [nil]
+      def print_volume_definition_in_cli_format(definition)
+        return if definition.dig(:docker_volume_configuration, :autoprovision)
+        # From version 1.20.0 of ECS agent, a local volume is provisioned when
+        # 'host' is specified without 'source_path'.
+        return if definition.dig(:host, :source_path)
+
+        cmd = %w[docker volume create]
+        if (configuration = definition[:docker_volume_configuration])
+          if configuration[:driver]
+            cmd << '--driver' << configuration[:driver]
+          end
+          (configuration[:driver_opts] || {}).each do |k, v|
+            cmd << '--opt' << "#{k}=#{v}"
+          end
+          (configuration[:labels] || {}).each do |k, v|
+            cmd << '--label' << "#{k}=#{v}"
+          end
+        end
+        cmd << definition[:name]
+        puts cmd.join(' ')
+        nil
+      end
+
+      # @param [Hash] definition
       # @param [Hash<String, String>] additional_env
       # @return [nil]
       def print_definition_in_cli_format(definition, additional_env: {})
@@ -1070,16 +1219,10 @@ module Hako
         end
         definition.fetch(:mount_points).each do |mount_point|
           source_volume = mount_point.fetch(:source_volume)
-          v = @volumes[source_volume]
-          if v
-            # When source_path is not given, ECS agent adds a container for generating empty volume to share between containers
-            #   https://docs.aws.amazon.com/AmazonECS/latest/developerguide/using_data_volumes.html
-            #   (To provide nonpersistent empty data volumes for containers)
-            source_path = v.fetch('source_path', "/tmp/ephemeral_#{source_volume}")
-            cmd << '--volume' << "#{source_path}:#{mount_point.fetch(:container_path)}#{mount_point[:read_only] ? ':ro' : ''}"
-          else
-            raise "Could not find volume #{source_volume}"
-          end
+          v = volumes_definition.find { |d| d[:name] == source_volume }
+          raise "Could not find volume #{source_volume}" unless v
+          source = v.dig(:host, :source_path) || source_volume
+          cmd << '--volume' << "#{source}:#{mount_point.fetch(:container_path)}#{mount_point[:read_only] ? ':ro' : ''}"
         end
         definition.fetch(:volumes_from).each do |volumes_from|
           cmd << '--volumes-from' << "#{volumes_from.fetch(:source_container)}#{volumes_from[:read_only] ? ':ro' : ''}"
@@ -1135,7 +1278,7 @@ module Hako
         definition.fetch(:environment).each do |env|
           name = env.fetch(:name)
           value = env.fetch(:value)
-          # additional_env (given in command line) has priority over env (declared in YAML)
+          # additional_env (given in command line) has priority over env (declared in definition file)
           unless additional_env.key?(name)
             cmd << '--env' << "#{name}=#{value}"
             cmd << "\\\n  "

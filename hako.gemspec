@@ -26,11 +26,12 @@ Gem::Specification.new do |spec|
   spec.add_dependency 'aws-sdk-cloudwatch'
   spec.add_dependency 'aws-sdk-cloudwatchlogs'
   spec.add_dependency 'aws-sdk-ec2'
-  spec.add_dependency 'aws-sdk-ecs', '>= 1.4.0'
+  spec.add_dependency 'aws-sdk-ecs', '>= 1.7.0'
   spec.add_dependency 'aws-sdk-elasticloadbalancing'
   spec.add_dependency 'aws-sdk-elasticloadbalancingv2'
   spec.add_dependency 'aws-sdk-s3'
   spec.add_dependency 'aws-sdk-sns'
+  spec.add_dependency 'aws-sdk-servicediscovery'
   spec.add_dependency 'jsonnet'
 
   spec.add_development_dependency 'bundler'
